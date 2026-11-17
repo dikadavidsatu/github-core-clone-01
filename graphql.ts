@@ -7,8 +7,8 @@
 
 import {
   Forge,
-  IssueRec,
-  PullRec,
+  type IssueRec,
+  type PullRec,
   Repo,
   VIEWER_ID,
   VIEWER_LOGIN,
@@ -85,14 +85,14 @@ function tokenize(source: string): string[] {
       i += 1;
       continue;
     }
+    if (ch === '.' && source.startsWith('...', i)) {
+      tokens.push('...');
+      i += 3;
+      continue;
+    }
     if ('{}()[]:@$!:=|&'.includes(ch)) {
-      if (source.startsWith('...', i)) {
-        tokens.push('...');
-        i += 3;
-      } else {
-        tokens.push(ch);
-        i += 1;
-      }
+      tokens.push(ch);
+      i += 1;
       continue;
     }
     if (ch === '"') {

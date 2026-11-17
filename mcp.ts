@@ -7,7 +7,7 @@
 // across surfaces. The server is stateless per request: concurrent calls answer under their
 // own JSON-RPC ids.
 
-import { Forge, IssueRec, PullRec, Repo, VIEWER_LOGIN, planPullMerge } from './store.ts';
+import { Forge, type IssueRec, type PullRec, type Repo, VIEWER_LOGIN, planPullMerge } from './store.ts';
 import { repoJson, issueJson, pullJson } from './rest.ts';
 
 const SUPPORTED_VERSIONS = ['2026-07-28', '2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];

@@ -4,8 +4,8 @@
 
 import {
   Forge,
-  IssueRec,
-  PullRec,
+  type IssueRec,
+  type PullRec,
   Repo,
   VIEWER_ID,
   VIEWER_LOGIN,

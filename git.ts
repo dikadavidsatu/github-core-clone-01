@@ -4,7 +4,7 @@
 
 import {
   Forge,
-  GitObj,
+  type GitObj,
   Repo,
   ZERO_OID,
   collectReachable,
@@ -387,25 +387,25 @@ function handleFetchV2(repo: Repo, packets: Pkt[]): GitHttpResult {
   const plan = planFetch(repo, request);
   const parts: Buffer[] = [];
   if (!done) {
-    parts.push(pktLine('acknowledgments'));
+    parts.push(pktLine('acknowledgments\n'));
     if (plan.common.length) for (const oid of plan.common) parts.push(pktLine(`ACK ${oid}`));
     else parts.push(pktLine('NAK'));
     parts.push(PKT_FLUSH);
     return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(parts) };
   }
   if (request.haves.length) {
-    parts.push(pktLine('acknowledgments'));
+    parts.push(pktLine('acknowledgments\n'));
     if (plan.common.length) for (const oid of plan.common) parts.push(pktLine(`ACK ${oid}`));
     else parts.push(pktLine('NAK'));
     parts.push(PKT_FLUSH);
   }
   if (plan.shallow.length || plan.unshallow.length) {
-    parts.push(pktLine('shallow-info'));
+    parts.push(pktLine('shallow-info\n'));
     for (const oid of plan.shallow) parts.push(pktLine(`shallow ${oid}`));
     for (const oid of plan.unshallow) parts.push(pktLine(`unshallow ${oid}`));
     parts.push(PKT_FLUSH);
   }
-  parts.push(pktLine('packfile'));
+  parts.push(pktLine('packfile\n'));
   parts.push(...sidebandPackets(plan.pack));
   parts.push(PKT_FLUSH);
   return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(parts) };
