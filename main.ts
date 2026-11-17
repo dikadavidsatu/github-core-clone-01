@@ -1,104 +1,145 @@
-// The entry <-> env lifecycle, as env/src/wire.ts settles it: bind an ephemeral port, tell the env the
-// port it bound, then poll until the env says the trial is over and exit 0. Keep this file as it is:
-// the suite scores the server app.ts builds, and the lifecycle is the harness's, not the contest's.
+// main.ts -- process entrypoint for the forge.
 //
-//   1. MAKEFUN_ENV_URL names the env's origin (http://store:8080 in a trial container). Without it
-//      there is nothing to talk to, so the program exits 1 at once.
-//   2. Create the server and listen(0): the kernel picks a free port. Never bind 8080 — the env owns it.
-//   3. POST $MAKEFUN_ENV_URL/register {"port": N}. The env records the address the request came from
-//      plus N as your base URL and dials it from then on. The first register wins; a 409 means another
-//      entry already registered, and this process keeps waiting like any other.
-//   4. GET $MAKEFUN_ENV_URL/done until the body is {"done": true}. The env answers at once ({"done":
-//      false} while the suite runs), so this is a poll, not a long-held request. A failed or slow poll
-//      is retried with a short exponential backoff; the process never exits before the env says done.
-//   5. Close the server and exit 0. The harness then stops the env, which writes the export the scorer
-//      reads.
+// The trial harness runs this file as the whole program (`node main.ts`), in
+// a pod whose only other occupant is the grading suite. The suite speaks to
+// us through the environment origin named by MAKEFUN_ENV_URL, and the
+// lifecycle it expects is:
 //
-// main.ts imports its own server and nothing else: no package, no Node built-in, no model call.
+//   1. We bring the forge up first. The HTTP app (see app.ts) must already
+//      be accepting connections before anything else happens, because the
+//      moment the suite learns our port it starts probing /healthz and
+//      driving traffic at us.
+//   2. We bind port 0 so the kernel picks a free ephemeral port -- never a
+//      fixed one, and never 8080, which belongs to the suite itself.
+//   3. We announce the chosen port with POST /register and a {"port": n}
+//      body. The suite notes the address that request arrived from and
+//      dials us back at that address plus this port.
+//   4. We then ask GET /done, again and again: it answers {"done": false}
+//      while the suite works and {"done": true} once the suite has written
+//      its export and needs nothing more from us.
+//   5. On "done" we close the listener and leave with exit code 0. Exiting
+//      earlier, or dying, would strand the suite mid-trial.
+//
+// Registration is retried patiently: the suite may still be coming up when
+// we first call, and a 409 from /register only means an earlier attempt of
+// ours already landed, which is the outcome we wanted anyway.
+
+import type { Server } from 'node:http';
 
 import { createApp } from './app.ts';
 
-const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
-if (ENV_URL === '') {
-  process.stderr.write('[entry] MAKEFUN_ENV_URL is not set: there is no env to register with\n');
-  process.exit(1);
+/** Pause between two polls of the suite's /done endpoint. */
+const DONE_POLL_PAUSE_MS = 300;
+/** Pause between two attempts to register with the suite. */
+const REGISTER_RETRY_PAUSE_MS = 500;
+/** Give up registering after this many attempts and fail the boot. */
+const REGISTER_MAX_ATTEMPTS = 600;
+/** Longest one call to the suite may hang before we abandon and retry it. */
+const SUITE_CALL_TIMEOUT_MS = 10_000;
+/** Grace period for the listener to drain before the exit is forced. */
+const SHUTDOWN_GRACE_MS = 1_500;
+
+function note(line: string): void {
+  process.stderr.write(`[forge] ${line}\n`);
 }
 
-/** How long one register or done request may take before it is abandoned and retried. */
-const REQUEST_TIMEOUT_MS = 30_000;
-/** The first wait between retries, and the longest. */
-const RETRY_INITIAL_MS = 250;
-const RETRY_MAX_MS = 2_000;
+function pause(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
 
-const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+/** The suite's origin, from the one variable the harness promises us. */
+function suiteOrigin(): string {
+  const raw = process.env.MAKEFUN_ENV_URL;
+  if (raw === undefined || raw.trim() === '') {
+    throw new Error('MAKEFUN_ENV_URL is not set: nowhere to register with');
+  }
+  return raw.replace(/\/+$/, '');
+}
 
-/** The wait after `attempt` failed requests: exponential from RETRY_INITIAL_MS, capped. */
-function retryDelay(attempt: number): number {
-  return Math.min(RETRY_MAX_MS, RETRY_INITIAL_MS * 2 ** Math.min(attempt, 8));
+/** Bind the forge to a kernel-chosen port and report which one it picked. */
+function bindForge(server: Server): Promise<number> {
+  return new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, () => {
+      server.removeListener('error', reject);
+      const address = server.address();
+      if (address === null || typeof address === 'string') {
+        reject(new Error('the forge listener has no port to announce'));
+        return;
+      }
+      resolve(address.port);
+    });
+  });
 }
 
 /**
- * POST the bound port until the env accepts it. 200 is the normal answer; 409 means a first register
- * already won, which is not this process's to fix. 400 and 405 are contract errors and end the program;
- * a network error or another status is retried, since the env may still be starting.
+ * Tell the suite where we listen. Retries through connection failures and
+ * unexpected statuses; both 200 (accepted) and 409 (an earlier attempt of
+ * ours was accepted first) mean the suite knows our port.
  */
-async function register(port: number): Promise<void> {
-  for (let attempt = 0; ; attempt += 1) {
+async function announcePort(origin: string, port: number): Promise<void> {
+  for (let attempt = 1; attempt <= REGISTER_MAX_ATTEMPTS; attempt += 1) {
     try {
-      const res = await fetch(`${ENV_URL}/register`, {
+      const reply = await fetch(`${origin}/register`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ port }),
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        signal: AbortSignal.timeout(SUITE_CALL_TIMEOUT_MS),
       });
-      if (res.status === 200 || res.status === 409) return;
-      if (res.status === 400 || res.status === 405) throw new Error(`register answered HTTP ${res.status}: ${await res.text()}`);
-    } catch (err) {
-      if (err instanceof Error && err.message.startsWith('register answered HTTP ')) throw err;
+      await reply.arrayBuffer().catch(() => undefined);
+      if (reply.status === 200 || reply.status === 409) return;
+      note(`register attempt ${attempt}: suite answered HTTP ${reply.status}, retrying`);
+    } catch {
+      note(`register attempt ${attempt}: suite unreachable, retrying`);
     }
-    await sleep(retryDelay(attempt));
+    await pause(REGISTER_RETRY_PAUSE_MS);
   }
+  throw new Error(`no registration after ${REGISTER_MAX_ATTEMPTS} attempts`);
 }
 
-/** Poll GET /done until it answers {"done":true}; never return before that. */
-async function waitForDone(): Promise<void> {
-  for (let attempt = 0; ; attempt += 1) {
+/**
+ * Ask the suite whether it has finished, until it says so. A failed or
+ * garbled answer counts as "not yet": the suite is the only judge of when
+ * the trial is over, and a transient hiccup must not end our run.
+ */
+async function waitForSuite(origin: string): Promise<void> {
+  for (;;) {
     try {
-      const res = await fetch(`${ENV_URL}/done`, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
-      if (res.ok) {
-        const body = (await res.json()) as { done?: unknown };
-        if (body.done === true) return;
+      const reply = await fetch(`${origin}/done`, {
+        signal: AbortSignal.timeout(SUITE_CALL_TIMEOUT_MS),
+      });
+      if (reply.ok) {
+        const body: unknown = await reply.json().catch(() => null);
+        if (typeof body === 'object' && body !== null && (body as { done?: unknown }).done === true) {
+          return;
+        }
       }
     } catch {
-      // The env is not answering yet, or the poll timed out: it is not done, so poll again.
+      // Not an ending: keep waiting for the suite's word.
     }
-    await sleep(retryDelay(attempt));
+    await pause(DONE_POLL_PAUSE_MS);
   }
 }
 
-/** Bound the port, register it, then wait for the env: the whole life of the process. */
-async function main(): Promise<void> {
-  const server = createApp();
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, () => resolve());
+/** Close the listener, then exit 0 whether the drain is prompt or not. */
+function shutDown(server: Server): void {
+  const force = setTimeout(() => {
+    process.exit(0);
+  }, SHUTDOWN_GRACE_MS);
+  server.close(() => {
+    clearTimeout(force);
+    process.exit(0);
   });
-  const address = server.address();
-  if (address === null || typeof address === 'string') throw new Error('the server did not bind an ephemeral TCP port');
-  process.stdout.write(`[entry] listening on port ${address.port}\n`);
-
-  await register(address.port);
-  process.stdout.write('[entry] registered; waiting for the env to say done\n');
-
-  await waitForDone();
-  server.close();
-  process.stdout.write('[entry] done\n');
 }
 
-try {
-  await main();
-  process.exit(0);
-} catch (err) {
-  process.stderr.write(`[entry] ${err instanceof Error ? err.message : String(err)}\n`);
-  process.exit(1);
-}
+const origin = suiteOrigin();
+const forge = createApp();
+const port = await bindForge(forge);
+note(`listening on ephemeral port ${port}`);
+await announcePort(origin, port);
+note('registered with the suite; serving until it is done');
+await waitForSuite(origin);
+note('the suite is done; shutting down');
+shutDown(forge);
